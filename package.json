@@ -1,0 +1,16 @@
+{
+  "name": "agentic-memory",
+  "version": "0.1.0",
+  "description": "Conversation memory for AI — multi-turn context, auto-trimming, persistence",
+  "main": "memory.js",
+  "files": ["memory.js", "memory.min.js", "README.md"],
+  "scripts": {
+    "minify": "npx terser memory.js -c -m -o memory.min.js"
+  },
+  "keywords": ["memory", "conversation", "context", "ai", "llm", "chat", "multi-turn", "zero-dependency"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/momomo-agent/agentic-memory.git"
+  }
+}
