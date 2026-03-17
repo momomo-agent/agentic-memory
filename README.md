@@ -1,207 +1,144 @@
-# ⚡ agentic-memory
+# agentic-memory
 
-Conversation memory for AI. Multi-turn context management with auto-trimming and persistence.
+AI memory — conversation context + knowledge retrieval. Zero dependencies.
 
-Zero dependencies. Works with [agentic-lite](https://github.com/momomo-agent/agentic-lite) or any LLM API.
-
-## Why
-
-Every AI chat app needs to:
-1. Track conversation history
-2. Stay within token limits
-3. Not lose context when the window overflows
-
-LangChain gives you 5 Memory classes, 3 buffer strategies, and a PhD in abstractions. agentic-memory gives you `createMemory()`.
+Part of the [agentic](https://momomo-agent.github.io/agentic/) family.
 
 ## Install
-
-```bash
-npm install agentic-memory
-```
-
-Or:
 
 ```html
 <script src="https://unpkg.com/agentic-memory/memory.js"></script>
 ```
 
-## Quick Start
-
-```js
-import { createMemory } from 'agentic-memory'
-
-const mem = createMemory({
-  maxTokens: 8000,
-  systemPrompt: 'You are a helpful assistant.',
-})
-
-// Add messages
-await mem.user('What is quantum computing?')
-await mem.assistant('Quantum computing uses qubits...')
-await mem.user('How does entanglement work?')
-
-// Get messages array — ready for any LLM API
-mem.messages()
-// → [
-//   { role: 'system', content: 'You are a helpful assistant.' },
-//   { role: 'user', content: 'What is quantum computing?' },
-//   { role: 'assistant', content: 'Quantum computing uses qubits...' },
-//   { role: 'user', content: 'How does entanglement work?' },
-// ]
+```bash
+npm install agentic-memory
 ```
 
-## With agentic-lite
+## Short-term: Conversation Context
 
 ```js
-import { ask } from 'agentic-lite'
-import { createMemory } from 'agentic-memory'
+const { createMemory } = AgenticMemory
 
 const mem = createMemory({ maxTokens: 8000 })
 
-async function chat(prompt) {
-  await mem.user(prompt)
+await mem.user('What is quantum computing?')
+await mem.assistant('Quantum computing uses qubits...')
 
-  const result = await ask(prompt, {
-    provider: 'anthropic',
-    apiKey: process.env.ANTHROPIC_API_KEY,
-    history: mem.history(),
-  })
+// Ready for LLM API
+const messages = mem.messages()
 
-  await mem.assistant(result.answer)
-  return result.answer
-}
-
-await chat('What is quantum computing?')
-await chat('How does it relate to cryptography?')  // has context!
+// Just the conversation (no system prompt)
+const history = mem.history()
 ```
 
-## Auto-Trimming
+Auto-trims when context exceeds `maxTokens`. Supports sliding window and summarize strategies.
 
-When the conversation exceeds `maxTokens`, agentic-memory trims automatically.
+## Long-term: Knowledge Retrieval
 
-### Sliding Window (default)
+```js
+const mem = createMemory({ knowledge: true })
 
-Drops oldest message pairs to stay within budget:
+// Learn — add documents to knowledge base
+await mem.learn('physics', 'Quantum computing uses qubits to perform calculations...')
+await mem.learn('ml', 'Neural networks are inspired by the human brain...')
+
+// Recall — semantic search
+const results = await mem.recall('How do quantum computers work?')
+// → [{ id: 'physics', chunk: '...', score: 0.87 }]
+
+// Forget — remove from knowledge base
+await mem.forget('physics')
+```
+
+Uses local TF-IDF by default (zero config). Supports OpenAI embeddings for production:
 
 ```js
 const mem = createMemory({
-  maxTokens: 4000,
-  trimStrategy: 'sliding',  // default
+  knowledge: true,
+  embedProvider: 'openai',
+  embedApiKey: 'sk-...',
 })
 ```
 
-### Summarize
-
-Summarizes older messages instead of dropping them:
+## Both Together
 
 ```js
 const mem = createMemory({
-  maxTokens: 4000,
-  trimStrategy: 'summarize',
+  maxTokens: 8000,
+  knowledge: true,
+  systemPrompt: 'You are a helpful assistant.',
 })
-```
 
-With a custom summarizer (e.g., use an LLM):
+// Build knowledge base
+await mem.learn('docs', longDocument)
 
-```js
-const mem = createMemory({
-  maxTokens: 4000,
-  trimStrategy: 'summarize',
-  summarize: async (messages) => {
-    const result = await ask(
-      `Summarize this conversation concisely:\n${messages.map(m => `${m.role}: ${m.content}`).join('\n')}`,
-      { apiKey: '...' }
-    )
-    return result.answer
-  },
-})
+// Conversation with context
+await mem.user('What does the doc say about X?')
+const context = await mem.recall('X')
+
+// Feed to LLM with both history and relevant knowledge
 ```
 
 ## Persistence
 
 ```js
 // Browser — localStorage
-const mem = createMemory({
-  storage: 'localStorage:my-chat',
-})
+const mem = createMemory({ storage: 'localStorage:my-chat' })
 
 // Node.js — file
-const mem = createMemory({
-  storage: 'file:./conversations/chat-1.json',
-})
+const mem = createMemory({ storage: 'file:./memory.json' })
 
 // Custom adapter
 const mem = createMemory({
-  storage: {
-    save(data) { db.put('chat', data) },
-    load() { return db.get('chat') },
-    clear() { db.delete('chat') },
-  },
+  storage: { save(data) { ... }, load() { ... }, clear() { ... } }
 })
+```
+
+## Multi-conversation
+
+```js
+const { createManager } = AgenticMemory
+
+const mgr = createManager()
+const chat1 = mgr.get('user-alice')
+const chat2 = mgr.get('user-bob')
+// Each has independent history and storage
 ```
 
 ## API
 
-### `createMemory(options?)`
+### createMemory(options)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `maxTokens` | `number` | `8000` | Token budget for context window |
-| `maxMessages` | `number` | `100` | Hard cap on message count |
-| `systemPrompt` | `string` | `null` | System prompt (always retained) |
-| `trimStrategy` | `string` | `'sliding'` | `'sliding'` or `'summarize'` |
-| `summarize` | `function` | built-in | Custom `(messages) => string` |
-| `storage` | `string\|object` | `null` | Persistence adapter |
-| `id` | `string` | auto | Conversation ID |
+| maxTokens | number | 8000 | Max tokens for context window |
+| maxMessages | number | 100 | Hard cap on message count |
+| systemPrompt | string | null | System prompt (always kept) |
+| trimStrategy | string | 'sliding' | 'sliding' or 'summarize' |
+| storage | string/object | null | Persistence adapter |
+| knowledge | boolean | false | Enable knowledge layer |
+| embedProvider | string | 'local' | 'local' or 'openai' |
+| embedApiKey | string | null | API key for embeddings |
 
-### Instance Methods
+### Memory Instance
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `mem.user(text)` | `Promise` | Add user message |
-| `mem.assistant(text)` | `Promise` | Add assistant message |
-| `mem.add(role, text)` | `Promise` | Add any role |
-| `mem.messages()` | `Message[]` | Full messages array (with system prompt) |
-| `mem.history()` | `Message[]` | Messages without system prompt |
-| `mem.last(n)` | `Message[]` | Last N messages |
-| `mem.lastAnswer()` | `string` | Last assistant response |
-| `mem.tokens()` | `number` | Current token estimate |
-| `mem.info()` | `object` | Conversation metadata |
-| `mem.fork()` | `Memory` | Branch the conversation |
-| `mem.clear()` | `this` | Reset messages |
-| `mem.export()` | `object` | Serialize state |
-| `mem.import(data)` | `this` | Restore state |
-| `mem.destroy()` | `void` | Clear everything + storage |
-
-### `createManager(options?)`
-
-Manage multiple conversations:
-
-```js
-import { createManager } from 'agentic-memory'
-
-const mgr = createManager()
-const chat1 = mgr.get('user-123')
-const chat2 = mgr.get('user-456')
-
-mgr.list()          // ['user-123', 'user-456']
-mgr.delete('user-123')
-```
-
-### `estimateTokens(text)`
-
-Quick token count estimate (~90% accurate, no external deps):
-
-```js
-import { estimateTokens } from 'agentic-memory'
-
-estimateTokens('Hello world')     // → 3
-estimateTokens('你好世界')         // → 3 (CJK-aware)
-```
+| Method | Description |
+|--------|-------------|
+| `user(text)` | Add user message |
+| `assistant(text)` | Add assistant message |
+| `messages()` | Get messages array for LLM API |
+| `history()` | Get messages without system prompt |
+| `learn(id, text)` | Add knowledge (requires `knowledge: true`) |
+| `recall(query)` | Search knowledge semantically |
+| `forget(id)` | Remove knowledge by ID |
+| `tokens()` | Current token estimate |
+| `info()` | Conversation metadata |
+| `clear()` | Clear messages |
+| `export()` / `import()` | Serialize/deserialize state |
 
 ## Size
 
-~13KB raw, ~4KB gzip. Zero dependencies.
+~4KB gzip (conversation + knowledge combined)
 
 ## License
 

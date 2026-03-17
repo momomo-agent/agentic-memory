@@ -1,22 +1,28 @@
 /**
- * agentic-memory — Conversation memory for AI
- * Zero dependencies. Manages multi-turn context with auto-trimming.
+ * agentic-memory — AI memory: conversation context + knowledge retrieval
+ * Zero dependencies. Short-term chat + long-term knowledge in one library.
  *
  * Usage:
  *   import { createMemory } from 'agentic-memory'
+ *
+ *   // Short-term: conversation context
  *   const mem = createMemory({ maxTokens: 8000 })
  *   mem.add('user', 'Hello')
- *   mem.add('assistant', 'Hi there!')
- *   const messages = mem.messages()  // ready for LLM API
+ *   mem.add('assistant', 'Hi!')
+ *   mem.messages()  // ready for LLM API
  *
- * With agentic-lite:
- *   import { ask } from 'agentic-lite'
- *   const result = await ask('Follow up question', {
- *     ...config,
- *     history: mem.messages()
- *   })
- *   mem.add('user', 'Follow up question')
- *   mem.add('assistant', result.answer)
+ *   // Long-term: knowledge retrieval
+ *   const mem = createMemory({ knowledge: true })
+ *   await mem.learn('doc-1', 'Quantum computing uses qubits...')
+ *   const results = await mem.recall('How do qubits work?')
+ *   // → [{ id: 'doc-1', chunk: '...', score: 0.87 }]
+ *
+ *   // Both together
+ *   const mem = createMemory({ maxTokens: 8000, knowledge: true })
+ *   await mem.learn('docs', longDocument)
+ *   mem.user('What does this doc say about X?')
+ *   const context = await mem.recall('X')
+ *   // Feed context + history to your LLM
  */
 ;(function (root, factory) {
   if (typeof module === 'object' && module.exports) module.exports = factory()
@@ -26,45 +32,39 @@
   'use strict'
 
   // ── Token estimation ─────────────────────────────────────────────
-  // GPT/Claude tokenizers average ~4 chars per token for English,
-  // ~2 chars for CJK. We use a simple heuristic — good enough for
-  // context window management without importing tiktoken (40MB).
 
   function estimateTokens(text) {
     if (!text) return 0
     let tokens = 0
     for (let i = 0; i < text.length; i++) {
       const code = text.charCodeAt(i)
-      // CJK ranges: roughly 2 chars per token
-      if (code >= 0x4E00 && code <= 0x9FFF ||   // CJK Unified
-          code >= 0x3400 && code <= 0x4DBF ||   // CJK Extension A
-          code >= 0xF900 && code <= 0xFAFF ||   // CJK Compat
-          code >= 0x3000 && code <= 0x303F ||   // CJK Punctuation
-          code >= 0xFF00 && code <= 0xFFEF) {   // Fullwidth
+      if (code >= 0x4E00 && code <= 0x9FFF ||
+          code >= 0x3400 && code <= 0x4DBF ||
+          code >= 0xF900 && code <= 0xFAFF ||
+          code >= 0x3000 && code <= 0x303F ||
+          code >= 0xFF00 && code <= 0xFFEF) {
         tokens += 0.5
       } else {
         tokens += 0.25
       }
     }
-    // Message overhead: role + formatting ≈ 4 tokens per message
     return Math.ceil(tokens)
   }
 
   function estimateMessagesTokens(messages) {
     let total = 0
     for (const msg of messages) {
-      total += 4 // message overhead
+      total += 4
       total += estimateTokens(msg.content)
       if (msg.name) total += estimateTokens(msg.name)
     }
-    total += 2 // conversation overhead
+    total += 2
     return total
   }
 
   // ── Summarizer ───────────────────────────────────────────────────
 
   function defaultSummarize(messages) {
-    // Simple extractive summary — take first line of each message
     const lines = []
     for (const msg of messages) {
       const first = msg.content.split('\n')[0].slice(0, 120)
@@ -77,12 +77,11 @@
   // ── Storage adapters ─────────────────────────────────────────────
 
   const storageAdapters = {
-    /** Browser localStorage */
     localStorage(key) {
       return {
         save(data) {
           try { localStorage.setItem(key, JSON.stringify(data)) }
-          catch (e) { /* quota exceeded, silently fail */ }
+          catch (e) { /* quota exceeded */ }
         },
         load() {
           try {
@@ -96,7 +95,6 @@
       }
     },
 
-    /** In-memory (no persistence, default) */
     memory() {
       let store = null
       return {
@@ -106,7 +104,6 @@
       }
     },
 
-    /** Node.js file storage */
     file(filepath) {
       return {
         save(data) {
@@ -131,17 +128,275 @@
     }
   }
 
+  // ── Knowledge layer (vector search) ──────────────────────────────
+
+  function chunkText(text, options = {}) {
+    const { maxChunkSize = 500, overlap = 50, separator = null } = options
+    if (!text || text.length <= maxChunkSize) return [text]
+
+    const chunks = []
+
+    if (separator) {
+      const parts = typeof separator === 'string' ? text.split(separator) : text.split(separator)
+      let current = ''
+      for (const part of parts) {
+        if (current.length + part.length > maxChunkSize && current.length > 0) {
+          chunks.push(current.trim())
+          current = current.slice(-overlap) + part
+        } else {
+          current += (current ? (typeof separator === 'string' ? separator : '\n') : '') + part
+        }
+      }
+      if (current.trim()) chunks.push(current.trim())
+      return chunks
+    }
+
+    const paragraphs = text.split(/\n\n+/)
+    let current = ''
+    for (const para of paragraphs) {
+      if (current.length + para.length + 2 > maxChunkSize && current.length > 0) {
+        chunks.push(current.trim())
+        current = current.slice(-overlap)
+      }
+      current += (current ? '\n\n' : '') + para
+    }
+    if (current.trim()) chunks.push(current.trim())
+
+    const result = []
+    for (const chunk of chunks) {
+      if (chunk.length <= maxChunkSize) { result.push(chunk); continue }
+      const sentences = chunk.match(/[^.!?]+[.!?]+\s*|[^.!?]+$/g) || [chunk]
+      let cur = ''
+      for (const sent of sentences) {
+        if (cur.length + sent.length > maxChunkSize && cur.length > 0) {
+          result.push(cur.trim())
+          cur = cur.slice(-overlap)
+        }
+        cur += sent
+      }
+      if (cur.trim()) result.push(cur.trim())
+    }
+    return result
+  }
+
+  function cosineSimilarity(a, b) {
+    let dot = 0, magA = 0, magB = 0
+    for (let i = 0; i < a.length; i++) {
+      dot += a[i] * b[i]
+      magA += a[i] * a[i]
+      magB += b[i] * b[i]
+    }
+    magA = Math.sqrt(magA)
+    magB = Math.sqrt(magB)
+    if (magA === 0 || magB === 0) return 0
+    return dot / (magA * magB)
+  }
+
+  function localEmbed(texts, vocabSize = 512) {
+    const vocab = new Map()
+    const allTokens = texts.map(t => tokenize(t))
+
+    for (const tokens of allTokens) {
+      for (const token of tokens) {
+        if (!vocab.has(token)) vocab.set(token, vocab.size % vocabSize)
+      }
+    }
+
+    const df = new Float32Array(vocabSize)
+    for (const tokens of allTokens) {
+      const seen = new Set()
+      for (const token of tokens) {
+        const idx = vocab.get(token) ?? (hashStr(token) % vocabSize)
+        if (!seen.has(idx)) { df[idx]++; seen.add(idx) }
+      }
+    }
+
+    return allTokens.map(tokens => {
+      const vec = new Float32Array(vocabSize)
+      const tf = new Map()
+      for (const token of tokens) {
+        const idx = vocab.get(token) ?? (hashStr(token) % vocabSize)
+        tf.set(idx, (tf.get(idx) || 0) + 1)
+      }
+      for (const [idx, count] of tf) {
+        const idf = Math.log((texts.length + 1) / (df[idx] + 1)) + 1
+        vec[idx] = (count / tokens.length) * idf
+      }
+      let mag = 0
+      for (let i = 0; i < vec.length; i++) mag += vec[i] * vec[i]
+      mag = Math.sqrt(mag)
+      if (mag > 0) for (let i = 0; i < vec.length; i++) vec[i] /= mag
+      return Array.from(vec)
+    })
+  }
+
+  function tokenize(text) {
+    return text.toLowerCase()
+      .replace(/[^\w\s\u4e00-\u9fff]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length > 1)
+  }
+
+  function hashStr(s) {
+    let h = 0
+    for (let i = 0; i < s.length; i++) {
+      h = ((h << 5) - h + s.charCodeAt(i)) | 0
+    }
+    return Math.abs(h)
+  }
+
+  async function fetchWithRetry(url, options, retries = 2) {
+    for (let i = 0; i <= retries; i++) {
+      try {
+        const res = await fetch(url, options)
+        if (res.status === 429) {
+          const wait = parseInt(res.headers.get('retry-after') || '2') * 1000
+          await new Promise(r => setTimeout(r, wait))
+          continue
+        }
+        if (!res.ok) {
+          const body = await res.text().catch(() => '')
+          throw new Error(`Embedding API error ${res.status}: ${body.slice(0, 200)}`)
+        }
+        return res
+      } catch (err) {
+        if (i === retries) throw err
+        await new Promise(r => setTimeout(r, 1000 * (i + 1)))
+      }
+    }
+  }
+
+  const embedProviders = {
+    async openai(texts, config) {
+      const baseUrl = config.baseUrl || 'https://api.openai.com/v1'
+      const model = config.model || 'text-embedding-3-small'
+      const res = await fetchWithRetry(`${baseUrl}/embeddings`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${config.apiKey}`,
+        },
+        body: JSON.stringify({ input: texts, model }),
+      })
+      const data = await res.json()
+      return data.data.map(d => d.embedding)
+    },
+  }
+
+  function createKnowledgeStore(options = {}) {
+    const {
+      provider = 'local',
+      apiKey = null,
+      baseUrl = null,
+      model = null,
+      chunkOptions = {},
+      batchSize = 100,
+    } = options
+
+    const config = { apiKey, baseUrl, model }
+    let entries = []
+    let needsReembed = false
+
+    async function embed(texts) {
+      if (provider === 'local') return localEmbed(texts)
+      const embedFn = embedProviders[provider] || embedProviders.openai
+      const all = []
+      for (let i = 0; i < texts.length; i += batchSize) {
+        const batch = texts.slice(i, i + batchSize)
+        const embeddings = await embedFn(batch, config)
+        all.push(...embeddings)
+      }
+      return all
+    }
+
+    return {
+      async add(id, text, metadata = {}) {
+        const chunks = chunkText(text, chunkOptions)
+        const embeddings = await embed(chunks)
+        for (let i = 0; i < chunks.length; i++) {
+          entries.push({
+            id, text, chunk: chunks[i], chunkIndex: i,
+            totalChunks: chunks.length, embedding: embeddings[i], metadata,
+          })
+        }
+        if (provider === 'local') needsReembed = true
+        return this
+      },
+
+      async search(query, searchOptions = {}) {
+        const { topK = 5, threshold = 0, filter = null, dedupe = true } = searchOptions
+        if (entries.length === 0) return []
+
+        if (provider === 'local' && needsReembed) {
+          const allTexts = entries.map(e => e.chunk)
+          allTexts.push(query)
+          const allEmbeddings = localEmbed(allTexts)
+          for (let i = 0; i < entries.length; i++) {
+            entries[i].embedding = allEmbeddings[i]
+          }
+          const queryEmbedding = allEmbeddings[allEmbeddings.length - 1]
+          needsReembed = false
+          return rankResults(entries, queryEmbedding, { topK, threshold, filter, dedupe })
+        }
+
+        const [queryEmbedding] = await embed([query])
+        return rankResults(entries, queryEmbedding, { topK, threshold, filter, dedupe })
+      },
+
+      remove(id) {
+        entries = entries.filter(e => e.id !== id)
+        if (provider === 'local') needsReembed = true
+        return this
+      },
+
+      ids() { return [...new Set(entries.map(e => e.id))] },
+      get size() { return new Set(entries.map(e => e.id)).size },
+      get chunkCount() { return entries.length },
+      clear() { entries = []; return this },
+
+      export() { return { entries: entries.map(e => ({ ...e })), provider, model: config.model } },
+      import(data) { entries = (data.entries || []).map(e => ({ ...e })); return this },
+    }
+  }
+
+  function rankResults(entries, queryEmbedding, { topK, threshold, filter, dedupe }) {
+    let scored = entries.map(entry => ({
+      ...entry, score: cosineSimilarity(queryEmbedding, entry.embedding),
+    }))
+    if (filter) scored = scored.filter(filter)
+    if (threshold > 0) scored = scored.filter(s => s.score >= threshold)
+    scored.sort((a, b) => b.score - a.score)
+    if (dedupe) {
+      const seen = new Set()
+      scored = scored.filter(s => {
+        if (seen.has(s.id)) return false
+        seen.add(s.id); return true
+      })
+    }
+    return scored.slice(0, topK).map(s => ({
+      id: s.id, chunk: s.chunk, score: Math.round(s.score * 1000) / 1000,
+      chunkIndex: s.chunkIndex, totalChunks: s.totalChunks, metadata: s.metadata,
+    }))
+  }
+
   // ── Core: createMemory ───────────────────────────────────────────
 
   function createMemory(options = {}) {
     const {
-      maxTokens = 8000,       // Max total tokens for context window
-      maxMessages = 100,       // Hard cap on message count
-      systemPrompt = null,     // System prompt (always kept)
-      trimStrategy = 'sliding', // 'sliding' | 'summarize'
-      summarize = null,         // Custom summarizer: (messages) => string | Promise<string>
-      storage = null,           // Storage adapter or 'localStorage:key' or 'file:path'
-      id = null,                // Conversation ID (for storage key)
+      maxTokens = 8000,
+      maxMessages = 100,
+      systemPrompt = null,
+      trimStrategy = 'sliding',
+      summarize = null,
+      storage = null,
+      id = null,
+      // Knowledge layer options
+      knowledge = false,
+      embedProvider = 'local',
+      embedApiKey = null,
+      embedBaseUrl = null,
+      embedModel = null,
+      chunkOptions = {},
     } = options
 
     // Resolve storage adapter
@@ -161,30 +416,41 @@
     let _messages = []
     let _summary = null
     let _metadata = { id: id || generateId(), created: Date.now(), turns: 0 }
+    let _systemPrompt = systemPrompt
 
-    // Load from storage if available
+    // Initialize knowledge store if enabled
+    const _knowledge = knowledge
+      ? createKnowledgeStore({
+          provider: embedProvider,
+          apiKey: embedApiKey,
+          baseUrl: embedBaseUrl,
+          model: embedModel,
+          chunkOptions,
+        })
+      : null
+
+    // Load from storage
     if (store) {
       const saved = store.load()
       if (saved) {
         _messages = saved.messages || []
         _summary = saved.summary || null
         _metadata = { ..._metadata, ...saved.metadata }
+        if (saved.knowledge && _knowledge) _knowledge.import(saved.knowledge)
       }
     }
 
     function _save() {
       if (store) {
-        store.save({
-          messages: _messages,
-          summary: _summary,
-          metadata: _metadata,
-        })
+        const data = { messages: _messages, summary: _summary, metadata: _metadata }
+        if (_knowledge) data.knowledge = _knowledge.export()
+        store.save(data)
       }
     }
 
     function _systemTokens() {
-      if (!systemPrompt) return 0
-      return 4 + estimateTokens(systemPrompt)
+      if (!_systemPrompt) return 0
+      return 4 + estimateTokens(_systemPrompt)
     }
 
     function _currentTokens() {
@@ -196,39 +462,24 @@
 
     async function _trim() {
       const budget = maxTokens
-      let current = _currentTokens()
-
-      if (current <= budget && _messages.length <= maxMessages) return
+      if (_currentTokens() <= budget && _messages.length <= maxMessages) return
 
       if (trimStrategy === 'summarize') {
-        // Summarize oldest half of messages
         const summarizer = summarize || defaultSummarize
         const half = Math.max(Math.floor(_messages.length / 2), 1)
         const toSummarize = _messages.slice(0, half)
         const summaryText = await Promise.resolve(summarizer(toSummarize))
-
-        if (_summary) {
-          _summary = _summary + '\n\n' + summaryText
-        } else {
-          _summary = summaryText
-        }
-
+        _summary = _summary ? _summary + '\n\n' + summaryText : summaryText
         _messages = _messages.slice(half)
 
-        // If still over budget after summarizing, trim the summary too
         if (_currentTokens() > budget) {
           const maxSummaryTokens = Math.floor(budget * 0.2)
           const summaryChars = maxSummaryTokens * 4
-          if (_summary.length > summaryChars) {
-            _summary = _summary.slice(-summaryChars)
-          }
+          if (_summary.length > summaryChars) _summary = _summary.slice(-summaryChars)
         }
       } else {
-        // Sliding window — drop oldest messages (keep pairs when possible)
         while (_currentTokens() > budget || _messages.length > maxMessages) {
           if (_messages.length <= 2) break
-
-          // Try to drop a user+assistant pair
           if (_messages[0].role === 'user' && _messages.length > 1 && _messages[1].role === 'assistant') {
             _messages.splice(0, 2)
           } else {
@@ -238,7 +489,7 @@
       }
     }
 
-    return {
+    const instance = {
       /** Add a message */
       async add(role, content) {
         _messages.push({ role, content })
@@ -248,42 +499,30 @@
         return this
       },
 
-      /** Add a user message */
       async user(content) { return this.add('user', content) },
-
-      /** Add an assistant message */
       async assistant(content) { return this.add('assistant', content) },
 
       /** Get messages array (ready for LLM API) */
       messages() {
         const result = []
-
-        // System prompt
-        if (systemPrompt) {
-          let sys = systemPrompt
+        if (_systemPrompt) {
+          let sys = _systemPrompt
           if (_summary) sys += '\n\n' + _summary
           result.push({ role: 'system', content: sys })
         } else if (_summary) {
           result.push({ role: 'system', content: _summary })
         }
-
-        // Conversation messages
         result.push(..._messages.map(m => ({ role: m.role, content: m.content })))
-
         return result
       },
 
-      /** Get messages without system prompt (for agentic-lite history) */
+      /** Get messages without system prompt */
       history() {
         return _messages.map(m => ({ role: m.role, content: m.content }))
       },
 
-      /** Get the last N messages */
-      last(n = 1) {
-        return _messages.slice(-n).map(m => ({ ...m }))
-      },
+      last(n = 1) { return _messages.slice(-n).map(m => ({ ...m })) },
 
-      /** Get last assistant response */
       lastAnswer() {
         for (let i = _messages.length - 1; i >= 0; i--) {
           if (_messages[i].role === 'assistant') return _messages[i].content
@@ -291,35 +530,24 @@
         return null
       },
 
-      /** Get current token estimate */
-      tokens() {
-        return _currentTokens()
-      },
+      tokens() { return _currentTokens() },
 
-      /** Get conversation info */
       info() {
         return {
-          id: _metadata.id,
-          turns: _metadata.turns,
-          messageCount: _messages.length,
-          tokens: _currentTokens(),
-          maxTokens,
-          hasSummary: !!_summary,
-          summary: _summary,
-          created: _metadata.created,
+          id: _metadata.id, turns: _metadata.turns,
+          messageCount: _messages.length, tokens: _currentTokens(),
+          maxTokens, hasSummary: !!_summary, summary: _summary,
+          created: _metadata.created, hasKnowledge: !!_knowledge,
+          knowledgeSize: _knowledge ? _knowledge.size : 0,
         }
       },
 
-      /** Update system prompt */
       setSystem(prompt) {
-        Object.defineProperty(options, 'systemPrompt', { value: prompt })
-        // Can't reassign const, use closure trick
-        // Actually just update directly since we close over nothing const
+        _systemPrompt = prompt
         _save()
         return this
       },
 
-      /** Clear all messages (keeps system prompt) */
       clear() {
         _messages = []
         _summary = null
@@ -328,95 +556,97 @@
         return this
       },
 
-      /** Fork — create a branch of this conversation */
       fork(newOptions = {}) {
         const forked = createMemory({
-          maxTokens,
-          maxMessages,
-          systemPrompt,
-          trimStrategy,
-          summarize,
-          ...newOptions,
-          id: generateId(),
+          maxTokens, maxMessages, systemPrompt: _systemPrompt,
+          trimStrategy, summarize, ...newOptions, id: generateId(),
         })
-        // Copy current state
-        for (const msg of _messages) {
-          forked.add(msg.role, msg.content)
-        }
+        for (const msg of _messages) forked.add(msg.role, msg.content)
         return forked
       },
 
-      /** Export full state */
       export() {
-        return {
+        const data = {
           messages: _messages.map(m => ({ ...m })),
-          summary: _summary,
-          metadata: { ..._metadata },
+          summary: _summary, metadata: { ..._metadata },
         }
+        if (_knowledge) data.knowledge = _knowledge.export()
+        return data
       },
 
-      /** Import state */
       import(data) {
         _messages = (data.messages || []).map(m => ({ ...m }))
         _summary = data.summary || null
         if (data.metadata) _metadata = { ..._metadata, ...data.metadata }
+        if (data.knowledge && _knowledge) _knowledge.import(data.knowledge)
         _save()
         return this
       },
 
-      /** Destroy — clear storage */
       destroy() {
         _messages = []
         _summary = null
+        if (_knowledge) _knowledge.clear()
         if (store) store.clear()
-      }
+      },
+
+      // ── Knowledge API ──────────────────────────────────────────
+
+      /** Learn — add knowledge (requires knowledge: true) */
+      async learn(id, text, metadata = {}) {
+        if (!_knowledge) throw new Error('Knowledge not enabled. Use createMemory({ knowledge: true })')
+        await _knowledge.add(id, text, metadata)
+        _save()
+        return this
+      },
+
+      /** Recall — search knowledge (requires knowledge: true) */
+      async recall(query, options = {}) {
+        if (!_knowledge) throw new Error('Knowledge not enabled. Use createMemory({ knowledge: true })')
+        return _knowledge.search(query, options)
+      },
+
+      /** Forget — remove knowledge by ID */
+      async forget(id) {
+        if (!_knowledge) throw new Error('Knowledge not enabled. Use createMemory({ knowledge: true })')
+        _knowledge.remove(id)
+        _save()
+        return this
+      },
+
+      /** Get knowledge store info */
+      knowledgeInfo() {
+        if (!_knowledge) return null
+        return { size: _knowledge.size, chunks: _knowledge.chunkCount, ids: _knowledge.ids() }
+      },
     }
+
+    return instance
   }
 
   // ── Multi-conversation manager ──────────────────────────────────
 
   function createManager(options = {}) {
-    const {
-      storagePrefix = 'agentic-memory',
-      defaultOptions = {},
-    } = options
-
+    const { storagePrefix = 'agentic-memory', defaultOptions = {} } = options
     const conversations = new Map()
 
     return {
-      /** Get or create a conversation by ID */
       get(id, opts = {}) {
         if (conversations.has(id)) return conversations.get(id)
-
         const mem = createMemory({
-          ...defaultOptions,
-          ...opts,
-          id,
+          ...defaultOptions, ...opts, id,
           storage: opts.storage || `localStorage:${storagePrefix}:${id}`,
         })
         conversations.set(id, mem)
         return mem
       },
-
-      /** List conversation IDs */
-      list() {
-        return [...conversations.keys()]
-      },
-
-      /** Delete a conversation */
+      list() { return [...conversations.keys()] },
       delete(id) {
         const mem = conversations.get(id)
-        if (mem) {
-          mem.destroy()
-          conversations.delete(id)
-        }
+        if (mem) { mem.destroy(); conversations.delete(id) }
       },
-
-      /** Clear all conversations */
       clear() {
-        for (const [id, mem] of conversations) {
-          mem.destroy()
-        }
+        for (const [, mem] of conversations) mem.destroy()
         conversations.clear()
       }
     }
@@ -431,8 +661,13 @@
   return {
     createMemory,
     createManager,
+    createKnowledgeStore,
     estimateTokens,
     estimateMessagesTokens,
     storageAdapters,
+    // Embed utilities
+    chunkText,
+    cosineSimilarity,
+    localEmbed,
   }
 })
