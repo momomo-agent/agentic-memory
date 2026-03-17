@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>agentic-memory — Conversation memory for AI</title>
-  <meta name="description" content="Multi-turn conversation memory with auto-trimming and persistence. Zero deps. 2KB gzip.">
+  <title>agentic-memory — AI memory — conversation + knowledge</title>
+  <meta name="description" content="Conversation context + knowledge retrieval. Short-term chat + long-term knowledge. Zero deps. 2KB gzip.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -179,8 +179,8 @@
 mem.<span class="fn">messages</span>()  <span class="cmt">// → ready for any LLM API</span></div>
   </div>
   <div class="code-block">
-    <div class="code-header">With agentic-lite</div>
-    <div class="code-body"><span class="kw">import</span> { <span class="fn">ask</span> } <span class="kw">from</span> <span class="str">'agentic-lite'</span>
+    <div class="code-header">With agentic-core</div>
+    <div class="code-body"><span class="kw">import</span> { <span class="fn">ask</span> } <span class="kw">from</span> <span class="str">'agentic-core'</span>
 <span class="kw">import</span> { <span class="fn">createMemory</span> } <span class="kw">from</span> <span class="str">'agentic-memory'</span>
 
 <span class="kw">const</span> mem = <span class="fn">createMemory</span>({ <span class="prop">maxTokens</span>: <span class="str">8000</span> })
@@ -225,7 +225,7 @@ mem.<span class="fn">messages</span>()  <span class="cmt">// → ready for any L
 
 <footer>
   <div class="wrap">
-    MIT · <a href="https://github.com/momomo-agent/agentic-memory">GitHub</a> · <a href="https://www.npmjs.com/package/agentic-memory">npm</a> · Part of <a href="https://github.com/momomo-agent/agentic-lite">agentic-lite</a>
+    MIT · <a href="https://github.com/momomo-agent/agentic-memory">GitHub</a> · <a href="https://www.npmjs.com/package/agentic-memory">npm</a> · Part of <a href="https://github.com/momomo-agent/agentic-core">agentic-core</a>
   </div>
 </footer>
 
