@@ -7,7 +7,7 @@ Part of the [agentic](https://momomo-agent.github.io/agentic/) family.
 ## Install
 
 ```html
-<script src="https://unpkg.com/agentic-memory/memory.js"></script>
+<script src="https://unpkg.com/agentic-memory/agentic-memory.js"></script>
 ```
 
 ```bash
